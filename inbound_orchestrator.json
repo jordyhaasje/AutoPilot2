@@ -1,0 +1,743 @@
+{
+  "name": "AutoPilot - Inbound Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "message",
+        "operation": "getAll",
+        "format": "resolved",
+        "additionalFields": {
+          "maxResults": 1,
+          "q": "is:unread"
+        }
+      },
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "TENANT_ID",
+              "value": "00000000-0000-0000-0000-00000000d001"
+            },
+            {
+              "name": "DEFAULT_LANG",
+              "value": "nl"
+            }
+          ]
+        }
+      },
+      "id": "config-tenant",
+      "name": "Config (Tenant)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Preprocess email data\nconst email = $input.first().json;\n\nreturn {\n  subject: email.subject || '',\n  body_text: email.textPlain || '',\n  body_html: email.textHtml || '',\n  sender_email: email.from || '',\n  message_id: email.id || '',\n  in_reply_to: email.inReplyTo || '',\n  thread_id: email.threadId || '',\n  sent_at: email.internalDate ? new Date(parseInt(email.internalDate)).toISOString() : new Date().toISOString(),\n  TENANT_ID: $('Config (Tenant)').item.json.TENANT_ID,\n  DEFAULT_LANG: $('Config (Tenant)').item.json.DEFAULT_LANG\n};"
+      },
+      "id": "preprocess",
+      "name": "Preprocess",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM autopilot.tenant_email_filters WHERE tenant_id = $1 AND active = true ORDER BY created_at",
+        "options": {}
+      },
+      "id": "fetch-filters",
+      "name": "Fetch Filters",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Apply email filters\nconst emailData = $('Preprocess').item.json;\nconst filters = $('Fetch Filters').item.json;\n\nlet filter_allow = true;\nlet filter_matched = false;\n\nfor (const filter of filters) {\n  let fieldValue = '';\n  \n  switch (filter.field) {\n    case 'from':\n      fieldValue = emailData.sender_email;\n      break;\n    case 'subject':\n      fieldValue = emailData.subject;\n      break;\n    case 'body':\n      fieldValue = emailData.body_text;\n      break;\n    case 'domain':\n      fieldValue = emailData.sender_email.split('@')[1] || '';\n      break;\n  }\n  \n  let matches = false;\n  if (filter.is_regex) {\n    try {\n      const regex = new RegExp(filter.pattern, 'i');\n      matches = regex.test(fieldValue);\n    } catch (e) {\n      matches = false;\n    }\n  } else {\n    matches = fieldValue.toLowerCase().includes(filter.pattern.toLowerCase());\n  }\n  \n  if (matches) {\n    filter_matched = true;\n    filter_allow = filter.action === 'allow';\n    break;\n  }\n}\n\nreturn {\n  ...emailData,\n  filter_allow,\n  filter_matched\n};"
+      },
+      "id": "apply-filters",
+      "name": "Apply Filters",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "filtered",
+              "leftValue": "={{ $json.filter_allow }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filtered-check",
+      "name": "Filtered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.notifications (tenant_id, type, payload, priority) VALUES ($1, 'email_filtered', $2, 'low');\nINSERT INTO autopilot.audit_logs (tenant_id, actor_type, action, target_type, metadata) VALUES ($1, 'system', 'email_filtered', 'message', $2);",
+        "options": {}
+      },
+      "id": "log-filtered",
+      "name": "Log Filtered",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1560, 200]
+    },
+    {
+      "parameters": {},
+      "id": "stop",
+      "name": "Stop",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1780, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.customers (tenant_id, email, name, locale) \nVALUES ($1, $2, $3, $4) \nON CONFLICT (tenant_id, email) DO UPDATE SET \n  name = COALESCE(EXCLUDED.name, autopilot.customers.name),\n  updated_at = NOW() \nRETURNING id;",
+        "options": {}
+      },
+      "id": "upsert-customer",
+      "name": "Upsert Customer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1560, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.conversations (tenant_id, customer_id, subject, external_thread_id, status) \nVALUES ($1, $2, $3, $4, 'open') \nON CONFLICT (tenant_id, external_thread_id) DO UPDATE SET \n  subject = COALESCE(EXCLUDED.subject, autopilot.conversations.subject),\n  updated_at = NOW() \nRETURNING id;",
+        "options": {}
+      },
+      "id": "upsert-conversation",
+      "name": "Upsert Conversation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1780, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.messages (tenant_id, conversation_id, customer_id, direction, subject, body_text, body_html, raw, sender_email, message_id, in_reply_to, sent_at) \nVALUES ($1, $2, $3, 'inbound', $4, $5, $6, $7, $8, $9, $10, $11);",
+        "options": {}
+      },
+      "id": "insert-message",
+      "name": "Insert Message (inbound)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "authentication": "apiKey",
+        "resource": "chat",
+        "prompt": "={{ $json.body_text }}",
+        "options": {
+          "model": "text-embedding-3-small"
+        }
+      },
+      "id": "embedding-message",
+      "name": "Embedding (message)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.3,
+      "position": [2220, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Convert embedding to vector string\nconst embedding = $('Embedding Message').item.json.embedding;\nreturn {\n  vector_string: JSON.stringify(embedding)\n};"
+      },
+      "id": "embedding-vector-string",
+      "name": "Embedding → Vector String (message)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2440, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.embeddings_messages (tenant_id, message_id, content, embedding) \nVALUES ($1, $2, $3, $4::vector);",
+        "options": {}
+      },
+      "id": "insert-message-embedding",
+      "name": "Insert Message Embedding",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2660, 400]
+    },
+    {
+      "parameters": {
+        "authentication": "apiKey",
+        "resource": "chat",
+        "prompt": "={{ $json.body_text }}",
+        "options": {
+          "model": "gpt-4o-mini",
+          "temperature": 0.1,
+          "systemMessage": "ROLE\nJe bent een strikte e-mail-classifier voor een klantenservice van dropshipwinkels.\n\nOUTPUT\nJe output is ALLEEN geldige JSON, exact dit schema:\n\n{\n  \"intent\": [\"return_request\",\"cancel_order\",\"address_change\",\"delivery_question\",\"threat\",\"negotiation\",\"general\",\"chargeback_risk\"],\n  \"threat_detected\": true|false,\n  \"sentiment\": \"positive\"|\"neutral\"|\"angry\"|\"threatening\",\n  \"name_detected\": \"string|null\",\n  \"language\": \"nl\"|\"en\"|\"de\"|\"fr\"|\"es\"|\"it\"|\"...\",\n  \"order_reference\": \"string|null\",\n  \"order_date\": \"YYYY-MM-DD|null\",\n  \"days_waiting\": int|null,\n  \"requested_compensation_percent\": int|null,\n  \"confidence\": float\n}\n\nINSTRUCTIES\n- Detecteer MULTI-intent: meerdere intents tegelijk is toegestaan.\n- Herken dreigementen (woorden o.a. \"politie\", \"advocaat\", \"instanties\", \"slechte reviews\") → intent bevat \"threat\" en threat_detected: true.\n- Herken chargeback-signalen (\"ik start een chargeback\", \"ik vraag mijn bank\", \"betaling blokkeren\") → intent bevat \"chargeback_risk\".\n- Herken onderhandelingsbedragen (\"geef 25% korting\") → zet requested_compensation_percent.\n- Herken orderreferentie (patronen als #123, DD-12345) en datum.\n- Begrijp RELATIEVE datums (\"gisteren\", \"eergisteren\", \"vorige week\", \"3 dagen geleden\") t.o.v. verzenddatum in input; reken die om naar een absolute YYYY-MM-DD en vul days_waiting als relevant voor leveringsvragen.\n- Name extractie: haal voornaam uit begroeting of ondertekening; anders null.\n- Detecteer taal van klant → \"language\".\n- Confidence ∈ [0..1]. Bij twijfel verlaag confidence.\n\nREGELS\n- GEEN uitleg, GEEN tekst buiten JSON.\n- Geen backticks. Alleen het JSON-object."
+        }
+      },
+      "id": "classifier",
+      "name": "Classifier (JSON)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.3,
+      "position": [2880, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse and validate JSON\nconst classifierOutput = $('Classifier (JSON)').item.json.text;\nlet valid = false;\nlet parsed = null;\n\ntry {\n  // Remove backticks and parse\n  const cleanJson = classifierOutput.replace(/```json\\s*|\\s*```/g, '');\n  parsed = JSON.parse(cleanJson);\n  valid = true;\n} catch (e) {\n  valid = false;\n}\n\nreturn {\n  valid,\n  parsed,\n  original: classifierOutput\n};"
+      },
+      "id": "parse-validate-json",
+      "name": "Parse/Validate JSON",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [3100, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "low-confidence",
+              "leftValue": "={{ $json.valid === false || ($json.parsed && $json.parsed.confidence < 0.7) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "low-confidence-check",
+      "name": "Low Confidence?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3320, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.notifications (tenant_id, conversation_id, type, payload, priority) VALUES ($1, $2, 'human_review_required', $3, 'high');\nINSERT INTO autopilot.audit_logs (tenant_id, actor_type, action, target_type, target_id, metadata) VALUES ($1, 'ai', 'low_confidence', 'conversation', $2, $3);",
+        "options": {}
+      },
+      "id": "log-low-confidence",
+      "name": "Log Low Confidence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [3540, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  dw.*, cs.*, ts.*, np.*, tr.*, \n  (SELECT return_address FROM autopilot.tenants WHERE id = $1) as return_address\nFROM autopilot.tenant_delivery_windows dw\nFULL OUTER JOIN autopilot.tenant_compensation_steps cs ON cs.tenant_id = $1\nFULL OUTER JOIN autopilot.tenant_threat_compensation_steps ts ON ts.tenant_id = $1\nFULL OUTER JOIN autopilot.tenant_return_steps rs ON rs.tenant_id = $1\nFULL OUTER JOIN autopilot.tenant_time_windows tw ON tw.tenant_id = $1\nFULL OUTER JOIN autopilot.tenant_negotiation_policy np ON np.tenant_id = $1\nFULL OUTER JOIN autopilot.tenant_rules tr ON tr.tenant_id = $1\nWHERE dw.tenant_id = $1 OR cs.tenant_id = $1 OR ts.tenant_id = $1 OR rs.tenant_id = $1 OR tw.tenant_id = $1 OR np.tenant_id = $1 OR tr.tenant_id = $1;",
+        "options": {}
+      },
+      "id": "fetch-policies",
+      "name": "Fetch Policies",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [3540, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT cs.*, o.order_reference, o.order_date, o.status\nFROM autopilot.conversation_state cs\nLEFT JOIN autopilot.orders o ON o.customer_id = (SELECT customer_id FROM autopilot.conversations WHERE id = cs.conversation_id)\nWHERE cs.conversation_id = $1;",
+        "options": {}
+      },
+      "id": "fetch-state-order",
+      "name": "Fetch State + Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [3760, 500]
+    },
+    {
+      "parameters": {
+        "authentication": "apiKey",
+        "resource": "chat",
+        "prompt": "={{ $json.body_text }}",
+        "options": {
+          "model": "text-embedding-3-small"
+        }
+      },
+      "id": "embedding-kb-query",
+      "name": "Embedding (KB query)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.3,
+      "position": [3980, 500]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Convert KB embedding to vector string\nconst embedding = $('Embedding (KB query)').item.json.embedding;\nreturn {\n  kb_vector_string: JSON.stringify(embedding)\n};"
+      },
+      "id": "embedding-vector-string-kb",
+      "name": "Embedding → Vector String (KB)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [4200, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT kb.title, kb.content, kb.category\nFROM autopilot.kb_chunks kb\nJOIN autopilot.embeddings_kb ek ON ek.kb_chunk_id = kb.id\nWHERE kb.tenant_id = $1\nORDER BY ek.embedding <-> $2::vector\nLIMIT 3;",
+        "options": {}
+      },
+      "id": "kb-similarity",
+      "name": "KB Similarity (Top 3)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [4420, 500]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Policy Engine - Decide actions\nconst classifier = $('Parse/Validate JSON').item.json.parsed;\nconst policies = $('Fetch Policies').item.json;\nconst state = $('Fetch State + Order').item.json;\nconst kbSnippets = $('KB Similarity (Top 3)').item.json;\nconst emailData = $('Apply Filters').item.json;\n\n// Build actions object\nconst actions = {\n  language_target: classifier.language || 'nl',\n  customer_name: classifier.name_detected || null,\n  intents: classifier.intent || [],\n  sentiment: classifier.sentiment || 'neutral',\n  kb_snippets: kbSnippets || [],\n  state: {\n    last_compensation_percent: state.last_compensation_percent,\n    last_return_step: state.last_return_step || 0,\n    days_waiting: classifier.days_waiting,\n    order_reference: classifier.order_reference,\n    order_date: classifier.order_date,\n    summary: state.summary\n  },\n  actions: {},\n  classifier_raw: classifier\n};\n\n// Determine compensation/return actions\nif (classifier.intent.includes('return_request')) {\n  const nextStep = (state.last_return_step || 0) + 1;\n  const returnStep = policies.find(p => p.step_index === nextStep && p.action);\n  \n  if (returnStep) {\n    actions.actions.return_step = {\n      step_index: nextStep,\n      action: returnStep.action,\n      template: returnStep.template,\n      last_offer_framing: returnStep.last_offer_framing\n    };\n    \n    if (returnStep.action === 'offer_compensation') {\n      const compStep = policies.find(p => p.step_index === (state.last_compensation_percent ? state.last_compensation_percent + 1 : 1) && p.percent);\n      if (compStep) {\n        actions.actions.compensation = {\n          percent: compStep.percent,\n          step_index: compStep.step_index\n        };\n      }\n    }\n  }\n}\n\n// Handle threats\nif (classifier.threat_detected) {\n  const threatStep = policies.find(p => p.step_index === 1 && p.percent >= 50);\n  if (threatStep) {\n    actions.actions.compensation = {\n      percent: threatStep.percent,\n      step_index: threatStep.step_index\n    };\n  }\n}\n\n// Handle chargeback risk\nif (classifier.intent.includes('chargeback_risk')) {\n  if (policies.chargeback_policy === 'extra_compensation') {\n    actions.actions.chargeback = {\n      type: 'offer_extra_compensation',\n      percent: policies.chargeback_extra_percent\n    };\n  } else {\n    actions.actions.chargeback = {\n      type: 'send_return_address'\n    };\n  }\n}\n\n// Handle delivery questions\nif (classifier.intent.includes('delivery_question')) {\n  const deliveryWindow = policies.find(p => \n    p.min_days && p.max_days && \n    classifier.days_waiting >= p.min_days && \n    classifier.days_waiting <= p.max_days\n  );\n  \n  if (deliveryWindow) {\n    actions.actions.delivery_window = {\n      min_days: deliveryWindow.min_days,\n      max_days: deliveryWindow.max_days,\n      notify_on_max: deliveryWindow.notify_on_max\n    };\n  }\n}\n\n// Handle general questions (prospects)\nif (classifier.intent.includes('general') && !state.order_reference) {\n  actions.actions.general_public_delivery = {\n    avg_min: policies.public_delivery_avg_min,\n    avg_max: policies.public_delivery_avg_max\n  };\n}\n\nreturn actions;"
+      },
+      "id": "policy-engine-decide",
+      "name": "Policy Engine Decide",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [4640, 500]
+    },
+    {
+      "parameters": {
+        "authentication": "apiKey",
+        "resource": "chat",
+        "prompt": "={{ JSON.stringify($json) }}",
+        "options": {
+          "model": "gpt-4o-mini",
+          "temperature": 0.4,
+          "systemMessage": "Je bent een vriendelijke, menselijke klantenservicemedewerker. Je schrijft kort, empathisch en duidelijk. Je antwoordt in de taal van de klant.\n\nKRITISCHE REGELS (DB-FIRST)\n- Gebruik ALLEEN informatie en regels die je als input krijgt\n- Bedenk GEEN beleid of feiten. GEEN extra kortingen of uitzonderingen buiten wat is meegegeven.\n- Schrijf NOOIT \"als AI\", \"language model\", of techniek.\n- Schrijf in de taal `language_target` uit input.\n\nTONE OF VOICE\n- Warm, menselijk, oplossingsgericht. Korte zinnen. Geen wolligheid.\n- Begin met een persoonlijke begroeting (gebruik `customer_name` als aanwezig; anders \"Hoi\" / \"Hi\" in juiste taal).\n- Toon empathie bij negatieve of boze toon, maar blijf kalm en professioneel.\n- Sluit af met de handtekening uit `policies.rules.writer_style.signature` als die aanwezig is.\n\nSTRUCTUUR (algemeen)\n1) Begroeting + korte erkenning/bedankt.\n2) Kern van het antwoord volgens policies + acties.\n3) Volgende stap (duidelijk, 1 zin).\n4) Afsluiting + signature.\n\nCONTRAINTS\n- Geen HTML, alleen platte tekst met lege regels tussen alinea's.\n- Geen interne variabelen of JSON copy-pasten.\n- Noem geen interne policy-namen of tabellen.\n\nOUTPUT\n- Alleen de e-mailtekst (subject bepaalt de workflow; jij schrijft alleen de body)."
+        }
+      },
+      "id": "writer",
+      "name": "Writer (final)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.3,
+      "position": [4860, 500]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "message",
+        "operation": "send",
+        "additionalFields": {
+          "to": "={{ $('Apply Filters').item.json.sender_email }}",
+          "subject": "Re: {{ $('Apply Filters').item.json.subject }}",
+          "text": "={{ $('Writer (final)').item.json.text }}"
+        }
+      },
+      "id": "gmail-send",
+      "name": "Gmail Send Reply",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [5080, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.messages (tenant_id, conversation_id, customer_id, direction, subject, body_text, sender_email, sent_at) \nVALUES ($1, $2, $3, 'outbound', $4, $5, $6, NOW());\n\nINSERT INTO autopilot.audit_logs (tenant_id, actor_type, action, target_type, target_id, metadata) \nVALUES ($1, 'ai', 'email_sent', 'conversation', $2, $7);",
+        "options": {}
+      },
+      "id": "log-outbound",
+      "name": "Log Outbound",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [5300, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.conversation_state (tenant_id, conversation_id, locked_name, last_compensation_percent, last_return_step, last_intents, last_sentiment, summary, last_message_at) \nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \nON CONFLICT (tenant_id, conversation_id) DO UPDATE SET \n  locked_name = COALESCE(EXCLUDED.locked_name, autopilot.conversation_state.locked_name),\n  last_compensation_percent = EXCLUDED.last_compensation_percent,\n  last_return_step = EXCLUDED.last_return_step,\n  last_intents = EXCLUDED.last_intents,\n  last_sentiment = EXCLUDED.last_sentiment,\n  summary = EXCLUDED.summary,\n  last_message_at = NOW(),\n  updated_at = NOW();",
+        "options": {}
+      },
+      "id": "update-conversation-state",
+      "name": "Update Conversation State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [5520, 500]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Build notifications\nconst actions = $('Policy Engine Decide').item.json;\nconst notifications = [];\n\n// Compensation offered\nif (actions.actions.compensation) {\n  notifications.push({\n    type: 'compensation_offered',\n    payload: {\n      percent: actions.actions.compensation.percent,\n      step_index: actions.actions.compensation.step_index\n    },\n    priority: 'normal'\n  });\n}\n\n// Last offer made\nif (actions.actions.return_step && actions.actions.return_step.last_offer_framing) {\n  notifications.push({\n    type: 'last_offer_made',\n    payload: { step_index: actions.actions.return_step.step_index },\n    priority: 'high'\n  });\n}\n\n// Return address sent\nif (actions.actions.return_step && actions.actions.return_step.action === 'give_return_address') {\n  notifications.push({\n    type: 'return_address_sent',\n    payload: {},\n    priority: 'normal'\n  });\n}\n\n// Threat detected\nif (actions.classifier_raw.threat_detected) {\n  notifications.push({\n    type: 'threat_detected',\n    payload: { intents: actions.classifier_raw.intent },\n    priority: 'high'\n  });\n}\n\n// Chargeback risk\nif (actions.classifier_raw.intent.includes('chargeback_risk')) {\n  notifications.push({\n    type: 'chargeback_risk_detected',\n    payload: {},\n    priority: 'urgent'\n  });\n}\n\n// Delivery window max reached\nif (actions.actions.delivery_window && actions.actions.delivery_window.notify_on_max) {\n  notifications.push({\n    type: 'delivery_window_max_reached',\n    payload: {\n      days_waiting: actions.state.days_waiting,\n      min_days: actions.actions.delivery_window.min_days,\n      max_days: actions.actions.delivery_window.max_days\n    },\n    priority: 'high'\n  });\n}\n\nreturn { notifications };"
+      },
+      "id": "build-notifications",
+      "name": "Build Notifications",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [5740, 500]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.notifications (tenant_id, conversation_id, type, payload, priority) VALUES ($1, $2, $3, $4, $5);",
+        "options": {}
+      },
+      "id": "insert-notifications",
+      "name": "Insert Notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [5960, 500]
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config (Tenant)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config (Tenant)": {
+      "main": [
+        [
+          {
+            "node": "Preprocess",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preprocess": {
+      "main": [
+        [
+          {
+            "node": "Fetch Filters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Filters": {
+      "main": [
+        [
+          {
+            "node": "Apply Filters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Filters": {
+      "main": [
+        [
+          {
+            "node": "Filtered?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtered?": {
+      "main": [
+        [
+          {
+            "node": "Log Filtered",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Stop",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Filtered": {
+      "main": [
+        [
+          {
+            "node": "Stop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Customer": {
+      "main": [
+        [
+          {
+            "node": "Upsert Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Conversation": {
+      "main": [
+        [
+          {
+            "node": "Insert Message (inbound)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Message (inbound)": {
+      "main": [
+        [
+          {
+            "node": "Embedding (message)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding (message)": {
+      "main": [
+        [
+          {
+            "node": "Embedding → Vector String (message)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding → Vector String (message)": {
+      "main": [
+        [
+          {
+            "node": "Insert Message Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Message Embedding": {
+      "main": [
+        [
+          {
+            "node": "Classifier (JSON)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classifier (JSON)": {
+      "main": [
+        [
+          {
+            "node": "Parse/Validate JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse/Validate JSON": {
+      "main": [
+        [
+          {
+            "node": "Low Confidence?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Low Confidence?": {
+      "main": [
+        [
+          {
+            "node": "Log Low Confidence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Policies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Policies": {
+      "main": [
+        [
+          {
+            "node": "Fetch State + Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch State + Order": {
+      "main": [
+        [
+          {
+            "node": "Embedding (KB query)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding (KB query)": {
+      "main": [
+        [
+          {
+            "node": "Embedding → Vector String (KB)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding → Vector String (KB)": {
+      "main": [
+        [
+          {
+            "node": "KB Similarity (Top 3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KB Similarity (Top 3)": {
+      "main": [
+        [
+          {
+            "node": "Policy Engine Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policy Engine Decide": {
+      "main": [
+        [
+          {
+            "node": "Writer (final)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Writer (final)": {
+      "main": [
+        [
+          {
+            "node": "Gmail Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Send Reply": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Outbound": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Conversation State": {
+      "main": [
+        [
+          {
+            "node": "Build Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notifications": {
+      "main": [
+        [
+          {
+            "node": "Insert Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-27T10:00:00.000Z",
+  "versionId": "1"
+}

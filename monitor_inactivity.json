@@ -1,0 +1,107 @@
+{
+  "name": "AutoPilot - Monitor Inactivity",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "TENANT_ID",
+              "value": "00000000-0000-0000-0000-00000000d001"
+            }
+          ]
+        }
+      },
+      "id": "config-tenant",
+      "name": "Config (Tenant)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT cs.conversation_id, cs.inactivity_days, c.subject, cu.email\nFROM autopilot.conversation_state cs\nJOIN autopilot.conversations c ON c.id = cs.conversation_id\nJOIN autopilot.customers cu ON cu.id = c.customer_id\nWHERE cs.tenant_id = $1 \n  AND cs.last_message_at < NOW() - INTERVAL '3 days'\n  AND c.status = 'open'\n  AND cs.inactivity_days >= 3;",
+        "options": {}
+      },
+      "id": "find-inactive-conversations",
+      "name": "Find Inactive Conversations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO autopilot.notifications (tenant_id, conversation_id, type, payload, priority) \nVALUES ($1, $2, 'inactivity_reminder', $3, 'normal');",
+        "options": {}
+      },
+      "id": "insert-inactivity-notification",
+      "name": "Insert Inactivity Notification",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Cron Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config (Tenant)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config (Tenant)": {
+      "main": [
+        [
+          {
+            "node": "Find Inactive Conversations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Inactive Conversations": {
+      "main": [
+        [
+          {
+            "node": "Insert Inactivity Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2025-01-27T10:00:00.000Z",
+  "versionId": "1"
+}
