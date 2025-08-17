@@ -15,7 +15,7 @@
       "id": "cron-trigger",
       "name": "Cron Trigger",
       "type": "n8n-nodes-base.cron",
-      "typeVersion": 1.1,
+      "typeVersion": 1,
       "position": [240, 300]
     },
     {
@@ -38,26 +38,48 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT cs.conversation_id, cs.inactivity_days, c.subject, cu.email\nFROM autopilot.conversation_state cs\nJOIN autopilot.conversations c ON c.id = cs.conversation_id\nJOIN autopilot.customers cu ON cu.id = c.customer_id\nWHERE cs.tenant_id = $1 \n  AND cs.last_message_at < NOW() - INTERVAL '3 days'\n  AND c.status = 'open'\n  AND cs.inactivity_days >= 3;",
+        "query": "SELECT cs.conversation_id, cs.inactivity_days, c.subject, cu.email\nFROM conversation_state cs\nJOIN conversations c ON c.id = cs.conversation_id\nJOIN customers cu ON cu.id = c.customer_id\nWHERE cs.tenant_id = $1 \n  AND cs.inactivity_days >= 3\n  AND c.status = 'open'\nORDER BY cs.inactivity_days DESC;",
         "options": {}
       },
       "id": "find-inactive-conversations",
       "name": "Find Inactive Conversations",
       "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.4,
-      "position": [680, 300]
+      "typeVersion": 2.6,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {
+          "id": "KpdXYnkZStlD3p2g",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Build inactivity notifications\nconst conversations = $(\"Find Inactive Conversations\").first().json;\nconst notifications = [];\n\nfor (const conv of conversations) {\n  notifications.push({\n    tenant_id: $(\"Config (Tenant)\").first().json.TENANT_ID,\n    conversation_id: conv.conversation_id,\n    type: \"inactivity_reminder\",\n    payload: {\n      inactivity_days: conv.inactivity_days,\n      subject: conv.subject,\n      customer_email: conv.email\n    },\n    priority: \"normal\"\n  });\n}\n\nreturn { notifications };"
+      },
+      "id": "build-inactivity-notifications",
+      "name": "Build Inactivity Notifications",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [900, 300]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO autopilot.notifications (tenant_id, conversation_id, type, payload, priority) \nVALUES ($1, $2, 'inactivity_reminder', $3, 'normal');",
+        "query": "INSERT INTO notifications (tenant_id, conversation_id, type, payload, priority) VALUES ($1, $2, $3, $4, $5);",
         "options": {}
       },
-      "id": "insert-inactivity-notification",
-      "name": "Insert Inactivity Notification",
+      "id": "insert-notifications",
+      "name": "Insert Notifications",
       "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.4,
-      "position": [900, 300]
+      "typeVersion": 2.6,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "KpdXYnkZStlD3p2g",
+          "name": "Postgres account"
+        }
+      }
     }
   ],
   "connections": {
@@ -87,7 +109,18 @@
       "main": [
         [
           {
-            "node": "Insert Inactivity Notification",
+            "node": "Build Inactivity Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Inactivity Notifications": {
+      "main": [
+        [
+          {
+            "node": "Insert Notifications",
             "type": "main",
             "index": 0
           }
@@ -95,13 +128,11 @@
       ]
     }
   },
-  "pinData": {},
   "settings": {
     "executionOrder": "v1"
   },
   "staticData": null,
-  "tags": [],
-  "triggerCount": 0,
-  "updatedAt": "2025-01-27T10:00:00.000Z",
+  "meta": null,
+  "pinData": null,
   "versionId": "1"
 }
